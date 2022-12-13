@@ -15,6 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
+CFLAGS=-I/opt/include
 NEED_GPERFTOOLS=1
 BRPC_PATH = ../../
 include $(BRPC_PATH)/config.mk
@@ -32,7 +33,7 @@ LIBPATHS = $(addprefix -L, $(LIBS))
 COMMA=,
 SOPATHS=$(addprefix -Wl$(COMMA)-rpath=, $(LIBS))
 
-STATIC_LINKINGS += -lthrift -lgflags -lbrpc -levent
+STATIC_LINKINGS += -lthrift -lthriftnb -lgflags -lbrpc -levent
 
 CLIENT_SOURCES = client.cpp
 CLIENT2_SOURCES = client2.cpp
@@ -57,38 +58,38 @@ clean:
 
 echo_client:$(PROTO_OBJS) $(CLIENT_OBJS) libechothrift.a
 	@echo "> Linking $@"
-	$(CXX) $(LIBPATHS) $(SOPATHS) -Xlinker "-(" $^ -Xlinker "-)" $(STATIC_LINKINGS) $(DYNAMIC_LINKINGS) -o $@
+	$(CXX) $(CFLAGS) $(LIBPATHS) $(SOPATHS) -Xlinker "-(" $^ -Xlinker "-)" $(STATIC_LINKINGS) $(DYNAMIC_LINKINGS) -o $@
 
 echo_client2:$(PROTO_OBJS) $(CLIENT2_OBJS) libechothrift.a
 	@echo "> Linking $@"
-	$(CXX) $(LIBPATHS) $(SOPATHS) -Xlinker "-(" $^ -Xlinker "-)" $(STATIC_LINKINGS) $(DYNAMIC_LINKINGS) -o $@
+	$(CXX) $(CFLAGS) $(LIBPATHS) $(SOPATHS) -Xlinker "-(" $^ -Xlinker "-)" $(STATIC_LINKINGS) $(DYNAMIC_LINKINGS) -o $@
 
 echo_server:$(PROTO_OBJS) $(SERVER_OBJS) libechothrift.a
 	@echo "> Linking $@"
-	$(CXX) $(LIBPATHS) $(SOPATHS) -Xlinker "-(" $^ libechothrift.a -Xlinker "-)" $(STATIC_LINKINGS) $(DYNAMIC_LINKINGS) -o $@
+	$(CXX) $(CFLAGS) $(LIBPATHS) $(SOPATHS) -Xlinker "-(" $^ libechothrift.a -Xlinker "-)" $(STATIC_LINKINGS) $(DYNAMIC_LINKINGS) -o $@
 
 echo_server2:$(PROTO_OBJS) $(SERVER2_OBJS) libechothrift.a
 	@echo "> Linking $@"
-	$(CXX) $(LIBPATHS) $(SOPATHS) -Xlinker "-(" $^ libechothrift.a -Xlinker "-)" $(STATIC_LINKINGS) $(DYNAMIC_LINKINGS) -o $@
+	$(CXX) $(CFLAGS) $(LIBPATHS) $(SOPATHS) -Xlinker "-(" $^ libechothrift.a -Xlinker "-)" $(STATIC_LINKINGS) $(DYNAMIC_LINKINGS) -o $@
 
 %.o:%.cpp libechothrift.a
 	@echo "> Compiling $@"
-	$(CXX) -c $(HDRPATHS) $(CXXFLAGS) $< -o $@
+	$(CXX) $(CFLAGS) -c $(HDRPATHS) $(CXXFLAGS) -lthriftnb -levent $< -o $@
 
 %.o:%.cc libechothrift.a
 	@echo "> Compiling $@"
-	$(CXX) -c $(HDRPATHS) $(CXXFLAGS) $< -o $@
+	$(CXX) $(CFLAGS) -c $(HDRPATHS) $(CXXFLAGS) -lthriftnb -levent $< -o $@
 
 libechothrift.a:
 	@echo "> Generating thrift files"
 	thrift --gen cpp echo.thrift
 	thrift --gen py echo.thrift
-	$(CXX) -c gen-cpp/echo_types.cpp -o echo_types.o
-	$(CXX) -c gen-cpp/EchoService.cpp -o EchoService.o
+	$(CXX) $(CFLAGS) -c gen-cpp/echo_types.cpp -o echo_types.o
+	$(CXX) $(CFLAGS) -c gen-cpp/EchoService.cpp -o EchoService.o
 	ar -crv libechothrift.a EchoService.o echo_types.o
 
 native_server: libechothrift.a
-	$(CXX) native_server.cpp gen-cpp/echo_types.cpp gen-cpp/EchoService.cpp $(HDRPATHS) $(LIBPATHS) $(SOPATHS) $(CXXFLAGS) -lthriftnb -lthrift -levent -lpthread -lgflags -lbrpc -o native_server
+	$(CXX) $(CFLAGS) native_server.cpp gen-cpp/echo_types.cpp gen-cpp/EchoService.cpp $(HDRPATHS) $(LIBPATHS) $(SOPATHS) $(CXXFLAGS) -lthriftnb -lthrift -levent -lpthread -lgflags -lbrpc -o native_server
 
 native_client: libechothrift.a
-	$(CXX) native_client.cpp gen-cpp/echo_types.cpp gen-cpp/EchoService.cpp $(HDRPATHS) $(LIBPATHS) $(SOPATHS) $(CXXFLAGS) -lthriftnb -lthrift -levent -lpthread -lgflags -lbrpc -o native_client
+	$(CXX) $(CFLAGS) native_client.cpp gen-cpp/echo_types.cpp gen-cpp/EchoService.cpp $(HDRPATHS) $(LIBPATHS) $(SOPATHS) $(CXXFLAGS) -lthriftnb -lthrift -levent -lpthread -lgflags -lbrpc -o native_client
