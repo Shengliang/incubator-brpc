@@ -15,4 +15,5 @@
 # specific language governing permissions and limitations
 # under the License.
 
-include ../echo_c++/Makefile
+# include ../echo_c++/Makefile
+include ../multi_threaded_echo_c++/Makefile

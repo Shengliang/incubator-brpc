@@ -24,7 +24,8 @@
 #include <gflags/gflags.h>
 
 DEFINE_bool(send_attachment, true, "Carry attachment along with response");
-DEFINE_int32(port, 8001, "TCP Port of this server");
+DEFINE_int32(port, 8114, "TCP Port of this server");
+DEFINE_int32(server_num, 26, "Number of servers");
 DEFINE_int32(idle_timeout_s, -1,
              "Connection will be closed if there is no "
              "read/write operations during the last `idle_timeout_s'");
@@ -68,10 +69,13 @@ public:
       curr_len -= cp_sz;
     }
 
+    _nreq << 1;
+#if 0
     LOG(INFO)
         << "Received from Stream=" << id << ": " << size << " LSN:" << LSN
         << " len:" << len << " curr_len:"
-        << curr_len; // << " n:" << n << " " << code << ":[" << msg << "]";
+        << curr_len << " n:" << n << " " << code << ":[" << msg.substr(0,16) << "]";
+#endif
     return 0;
   }
   virtual void on_idle_timeout(brpc::StreamId id) {
@@ -80,6 +84,7 @@ public:
   virtual void on_closed(brpc::StreamId id) {
     LOG(INFO) << "Stream=" << id << " is closed";
   }
+  bvar::Adder<size_t> _nreq;
 };
 
 // Your implementation of example::EchoService
@@ -104,6 +109,7 @@ public:
     }
     response->set_message("Accepted stream");
   }
+  size_t num_requests() const { return _receiver._nreq.get_value(); }
 
 private:
   StreamReceiver _receiver;
@@ -114,30 +120,46 @@ int main(int argc, char *argv[]) {
   // Parse gflags. We recommend you to use gflags as well.
   GFLAGS_NS::ParseCommandLineFlags(&argc, &argv, true);
 
-  // Generally you only need one Server.
-  brpc::Server server;
+  brpc::Server* servers = new brpc::Server[FLAGS_server_num];
+  StreamingEchoService* echo_service_impls = new StreamingEchoService[FLAGS_server_num];
 
-  // Instance of your service.
-  StreamingEchoService echo_service_impl;
-
-  // Add the service into server. Notice the second parameter, because the
-  // service is put on stack, we don't want server to delete it, otherwise
-  // use brpc::SERVER_OWNS_SERVICE.
-  if (server.AddService(&echo_service_impl, brpc::SERVER_DOESNT_OWN_SERVICE) !=
-      0) {
-    LOG(ERROR) << "Fail to add service";
-    return -1;
+  for (int i = 0; i < FLAGS_server_num; ++i) {
+     servers[i].set_version(butil::string_printf("example/streaming_echo_c++[%d]", i)); 
+     if (servers[i].AddService(&echo_service_impls[i], brpc::SERVER_DOESNT_OWN_SERVICE) != 0) {
+       LOG(ERROR) << "Fail to add service";
+       return -1;
+     }
+     brpc::ServerOptions options;
+     options.idle_timeout_sec = FLAGS_idle_timeout_s;
+     int port = FLAGS_port + i;
+     if (servers[i].Start(port, &options) != 0) {
+       LOG(ERROR) << "Fail to start EchoServer";
+       return -1;
+     }
   }
 
-  // Start the server.
-  brpc::ServerOptions options;
-  options.idle_timeout_sec = FLAGS_idle_timeout_s;
-  if (server.Start(FLAGS_port, &options) != 0) {
-    LOG(ERROR) << "Fail to start EchoServer";
-    return -1;
+  std::vector<size_t> last_num_requests(FLAGS_server_num);
+  while(!brpc::IsAskedToQuit()) {
+     sleep(1);
+     size_t cur_total = 0;
+     for (int i = 0; i < FLAGS_server_num; ++i) {
+         const size_t current_num_requests =
+                 echo_service_impls[i].num_requests();
+         size_t diff = current_num_requests - last_num_requests[i];
+         cur_total += diff;
+         last_num_requests[i] = current_num_requests;
+         LOG(INFO) << "S[" << i << "]=" << diff << ' ' << noflush;
+     }
+     LOG(INFO) << "[total=" << cur_total << ']';
+  }
+  for (int i = 0; i < FLAGS_server_num; ++i) {
+	  servers[i].Stop(FLAGS_logoff_ms);
+  }
+  for (int i = 0; i < FLAGS_server_num; ++i) {
+	  servers[i].Join();
   }
 
-  // Wait until Ctrl-C is pressed, then Stop() and Join() the server.
-  server.RunUntilAskedToQuit();
+  delete [] servers;
+  delete [] echo_service_impls;
   return 0;
 }
