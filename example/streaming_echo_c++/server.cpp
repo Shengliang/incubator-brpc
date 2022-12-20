@@ -136,6 +136,7 @@ int main(int argc, char *argv[]) {
        LOG(ERROR) << "Fail to start EchoServer";
        return -1;
      }
+     LOG(INFO) << " Start echo server:" << port;
   }
 
   std::vector<size_t> last_num_requests(FLAGS_server_num);

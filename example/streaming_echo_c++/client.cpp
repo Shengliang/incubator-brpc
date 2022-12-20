@@ -34,7 +34,7 @@ DEFINE_string(connection_type, "", "Connection type. Available values: single, p
 DEFINE_string(protocol, "baidu_std", "Protocol type. Defined in src/brpc/options.proto");
 DEFINE_string(server, "10.231.229.157:8114", "IP Address of server, port + i");
 DEFINE_string(load_balancer, "rr", "Name of load balancer");
-DEFINE_int32(timeout_ms, 100, "RPC timeout in milliseconds");
+DEFINE_int32(timeout_ms, 1000, "RPC timeout in milliseconds");
 DEFINE_int32(backup_ms, -1, "backup timeout in milliseconds");
 DEFINE_int32(max_retry, 3, "Max retries(not including the first RPC)");
 
@@ -47,7 +47,7 @@ struct MmChannel {
   // Channel is thread-safe and can be shared by all threads in your program.
   brpc::Channel channel;
   brpc::StreamId streamId;
-  brpc::Controller cntl;
+  brpc::Controller stream_cntl;
   butil::EndPoint pt;
   int id;
 
@@ -57,20 +57,21 @@ struct MmChannel {
     LOG(INFO) << "EchoClient is going to quit" << streamId;
   } 
 
-  int Init(butil::EndPoint pt, int id) {
+  void SetEndPoint(int id, butil::EndPoint pt) {
     this->id = id;
     this->pt = pt;
+  }
+  int Init() {
     brpc::ChannelOptions sch_options;
     sch_options.timeout_ms = FLAGS_timeout_ms;
     sch_options.backup_request_ms = FLAGS_backup_ms;
     sch_options.max_retry = FLAGS_max_retry;
-    pt.port += id;
     if (channel.Init(pt, NULL) != 0) {
        LOG(ERROR) << "Fail to initialize channel";
        return -1;
     }
 
-    if (brpc::StreamCreate(&streamId, cntl, NULL) != 0) {
+    if (brpc::StreamCreate(&streamId, stream_cntl, NULL) != 0) {
       LOG(ERROR) << "Fail to create stream";
       return -1;
     }
@@ -86,22 +87,7 @@ struct MmChannel {
 
 
 static void* sender(void* arg) {
-    example::EchoRequest request;
-    example::EchoResponse response;
-    request.set_message("I'm a RPC to connect stream");
-
-    int log_id = 0;
     auto &channel = *static_cast<MmChannel*>(arg);
-    example::EchoService_Stub stub(&channel.channel);
-    channel.cntl.set_log_id(log_id++);
-    stub.Echo(&channel.cntl, &request, &response, NULL);
-    if (channel.cntl.Failed()) {
-      LOG(ERROR) << "Fail to connect stream, " << channel.cntl.ErrorText();
-      g_error_count << 1;
-      bthread_usleep(50000);
-      return NULL;
-    }
-    g_latency_recorder << channel.cntl.latency_us();
   uint64_t LSN = 0ULL;
 
   auto streaming = [&](MmChannel & channel, void const *msg, uint32_t len) -> int {
@@ -118,10 +104,10 @@ static void* sender(void* arg) {
     int rc = 0;
     do {
       if (rc == EAGAIN)
-        sleep(0.1);
+        sleep(0.01);
       rc = channel.Write(pkt);
-      g_latency_recorder << channel.cntl.latency_us();
-    } while (rc == EAGAIN);
+      g_latency_recorder << channel.stream_cntl.latency_us();
+    } while (rc == EAGAIN && !brpc::IsAskedToQuit());
     return 0;
   };
 
@@ -135,7 +121,7 @@ static void* sender(void* arg) {
     ++LSN;
     uint32_t sz = std::min(len, (uint32_t)sizeof(page));
     streaming(channel, page, sz);
-    sleep(0.2);
+    sleep(0.01);
     ++len;
     len %= 1024;
   }
@@ -149,7 +135,6 @@ int main(int argc, char *argv[]) {
   N = FLAGS_thread_num;
 
   std::vector<MmChannel> channels(N);
-  int id = 0;
   butil::EndPoint pt;
 
     if (str2endpoint(FLAGS_server.c_str(), &pt) != 0 &&
@@ -158,8 +143,27 @@ int main(int argc, char *argv[]) {
        return -1;
     }
 
-  for(auto& channel : channels) {
-    channel.Init(pt, id++);
+  for(int i = 0; i < N; ++i) {
+     LOG(INFO) << "init channel:" << i << " " << pt.port;
+     channels[i].stream_cntl.set_log_id(i);
+     channels[i].SetEndPoint(i, pt);
+     channels[i].Init();
+     pt.port++;
+  }
+
+
+  for(int i = 0; i < N; ++i) {
+     example::EchoRequest request;
+     example::EchoResponse response;
+     request.set_message("I'm a RPC to connect stream");
+     example::EchoService_Stub stub(&channels[i].channel);
+     stub.Echo(&channels[i].stream_cntl, &request, &response, NULL);
+     if (channels[i].stream_cntl.Failed()) {
+       LOG(ERROR) << "Fail to connect stream, " << channels[i].stream_cntl.ErrorText();
+       g_error_count << 1;
+     } else {
+       LOG(INFO) << "channel:" << i << " ok ";
+     }
   }
 
   std::vector<bthread_t> bids(N);
