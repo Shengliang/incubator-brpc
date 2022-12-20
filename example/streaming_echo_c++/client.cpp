@@ -54,7 +54,7 @@ struct MmChannel {
   MmChannel() { } 
   ~MmChannel() { 
     CHECK_EQ(0, brpc::StreamClose(streamId));
-    LOG(INFO) << "EchoClient is going to quit" << streamId;
+    LOG(INFO) << "EchoClient is going to quit:" << streamId;
   } 
 
   void SetEndPoint(int id, butil::EndPoint pt) {
@@ -88,7 +88,23 @@ struct MmChannel {
 
 static void* sender(void* arg) {
     auto &channel = *static_cast<MmChannel*>(arg);
-  uint64_t LSN = 0ULL;
+    uint64_t LSN = 0ULL;
+
+    channel.Init();
+
+     example::EchoRequest request;
+     example::EchoResponse response;
+     request.set_message("I'm a RPC to connect stream");
+     example::EchoService_Stub stub(&channel.channel);
+     stub.Echo(&channel.stream_cntl, &request, &response, NULL);
+     if (channel.stream_cntl.Failed()) {
+       LOG(ERROR) << "Fail to connect stream, " << channel.stream_cntl.ErrorText();
+       g_error_count << 1;
+       return NULL;
+     } else {
+       LOG(INFO) << "channel:" << channel.id << " ok ";
+     }
+
 
   auto streaming = [&](MmChannel & channel, void const *msg, uint32_t len) -> int {
     butil::IOBuf pkt;
@@ -147,24 +163,9 @@ int main(int argc, char *argv[]) {
      LOG(INFO) << "init channel:" << i << " " << pt.port;
      channels[i].stream_cntl.set_log_id(i);
      channels[i].SetEndPoint(i, pt);
-     channels[i].Init();
      pt.port++;
   }
 
-
-  for(int i = 0; i < N; ++i) {
-     example::EchoRequest request;
-     example::EchoResponse response;
-     request.set_message("I'm a RPC to connect stream");
-     example::EchoService_Stub stub(&channels[i].channel);
-     stub.Echo(&channels[i].stream_cntl, &request, &response, NULL);
-     if (channels[i].stream_cntl.Failed()) {
-       LOG(ERROR) << "Fail to connect stream, " << channels[i].stream_cntl.ErrorText();
-       g_error_count << 1;
-     } else {
-       LOG(INFO) << "channel:" << i << " ok ";
-     }
-  }
 
   std::vector<bthread_t> bids(N);
   std::vector<pthread_t> pids(N);
