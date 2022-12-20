@@ -56,7 +56,7 @@ public:
     int data_size = 0;
     std::string msg;
     uint32_t curr_len = len;
-    while (i < size && iobuf->size() > 0 && curr_len > 0) {
+    while (i < size && iobuf->size() > 0 && curr_len > 0 && !brpc::IsAskedToQuit()) {
       iobuf = messages[i];
       uint32_t sz = std::min(curr_len, 128U);
       std::string bufstr;

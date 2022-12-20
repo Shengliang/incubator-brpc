@@ -90,7 +90,9 @@ static void* sender(void* arg) {
     auto &channel = *static_cast<MmChannel*>(arg);
     uint64_t LSN = 0ULL;
 
-    channel.Init();
+    do {
+     channel.stream_cntl.Reset();
+     channel.Init();
 
      example::EchoRequest request;
      example::EchoResponse response;
@@ -98,12 +100,14 @@ static void* sender(void* arg) {
      example::EchoService_Stub stub(&channel.channel);
      stub.Echo(&channel.stream_cntl, &request, &response, NULL);
      if (channel.stream_cntl.Failed()) {
-       LOG(ERROR) << "Fail to connect stream, " << channel.stream_cntl.ErrorText();
+       //LOG(ERROR) << "Fail to connect stream, " << channel.stream_cntl.ErrorText();
        g_error_count << 1;
-       return NULL;
+       sleep(1);
      } else {
        LOG(INFO) << "channel:" << channel.id << " ok ";
+        break;
      }
+    } while (channel.stream_cntl.Failed() && !brpc::IsAskedToQuit());
 
 
   auto streaming = [&](MmChannel & channel, void const *msg, uint32_t len) -> int {
