@@ -21,6 +21,8 @@
 #include <bthread/bthread.h>
 #include <brpc/channel.h>
 #include <brpc/stream.h>
+#include <butil/synchronization/condition_variable.h>
+#include "brpc/rdma/rdma_helper.h"
 #include <butil/logging.h>
 #include <brpc/selective_channel.h>
 #include <gflags/gflags.h>
@@ -37,10 +39,85 @@ DEFINE_string(load_balancer, "rr", "Name of load balancer");
 DEFINE_int32(timeout_ms, 1000, "RPC timeout in milliseconds");
 DEFINE_int32(backup_ms, -1, "backup timeout in milliseconds");
 DEFINE_int32(max_retry, 3, "Max retries(not including the first RPC)");
+DEFINE_bool(use_rdma, false, "use rdma or not");
 
 
 bvar::LatencyRecorder g_latency_recorder("client");
 bvar::Adder<int> g_error_count("client_error_count");
+
+class StreamReceiver : public brpc::StreamInputHandler {
+public:
+  virtual int on_received_messages(brpc::StreamId id,
+                                   butil::IOBuf *const messages[],
+                                   size_t size) {
+    if (size == 0)
+      return 0;
+
+    auto *iobuf = messages[0];
+    uint64_t LSN = 0ULL;
+    uint32_t len = 0;
+    int n = 0;
+    char code[5];
+    code[4] = '\0';
+    if (iobuf->size() >= 16) {
+      n = iobuf->cutn(code, 4);
+      n += iobuf->cutn(&len, 4);
+      n += iobuf->cutn(&LSN, 8);
+    }
+
+    size_t i = 0;
+    int data_size = 0;
+    std::string msg;
+    uint32_t curr_len = len;
+    while (i < size && iobuf->size() > 0 && curr_len > 0 && !brpc::IsAskedToQuit()) {
+      iobuf = messages[i];
+      uint32_t sz = std::min(curr_len, 128U);
+      std::string bufstr;
+      uint32_t cp_sz = iobuf->cutn(&bufstr, sz);
+      msg += bufstr;
+      data_size += cp_sz;
+      if (iobuf->size() == 0) {
+        ++i;
+      }
+      curr_len -= cp_sz;
+    }
+
+    _nreq << 1;
+#if 1
+    LOG(INFO)
+        << "Received from Stream=" << id << ": " << size << " LSN:" << LSN
+        << " len:" << len << " curr_len:"
+        << curr_len << " n:" << n << " " << code << ":[" << msg.substr(0,16) << "]";
+#endif
+    return 0;
+  }
+
+  virtual void on_idle_timeout(brpc::StreamId id) {
+    LOG(INFO) << "Stream=" << id << " has no data transmission for a while";
+  }
+  virtual void on_closed(brpc::StreamId id) {
+    LOG(INFO) << "Stream=" << id << " is closed";
+  }
+  bvar::Adder<size_t> _nreq;
+};
+
+  struct WriteControl {
+    WriteControl() : cv(&mu) {}
+    mutable butil::Mutex mu;
+    mutable butil::ConditionVariable cv;
+    bool is_writable = false;
+    int error_code = 0;
+    void on_writable(int ec) {
+	    BAIDU_SCOPED_LOCK(mu);
+	    is_writable = true;
+	    error_code = ec;
+	    cv.Broadcast();
+    }
+  };
+  void mm_channel_on_writable(brpc::StreamId, void* arg, int error_code) {
+     auto ctrl = reinterpret_cast<WriteControl*>(arg);
+     ctrl->on_writable(error_code);
+  };
 
 struct MmChannel {
   // A Channel represents a communication line to a Server. Notice that
@@ -48,6 +125,9 @@ struct MmChannel {
   brpc::Channel channel;
   brpc::StreamId streamId;
   brpc::Controller stream_cntl;
+  brpc::ChannelOptions sch_options;
+  brpc::StreamOptions stream_options;
+  StreamReceiver _receiver;
   butil::EndPoint pt;
   int id;
 
@@ -62,16 +142,19 @@ struct MmChannel {
     this->pt = pt;
   }
   int Init() {
-    brpc::ChannelOptions sch_options;
+    sch_options.protocol = FLAGS_protocol;
+    sch_options.connection_type = FLAGS_connection_type;
     sch_options.timeout_ms = FLAGS_timeout_ms;
     sch_options.backup_request_ms = FLAGS_backup_ms;
     sch_options.max_retry = FLAGS_max_retry;
-    if (channel.Init(pt, NULL) != 0) {
+    sch_options.use_rdma = FLAGS_use_rdma;
+    if (channel.Init(pt, &sch_options) != 0) {
        LOG(ERROR) << "Fail to initialize channel";
        return -1;
     }
 
-    if (brpc::StreamCreate(&streamId, stream_cntl, NULL) != 0) {
+    stream_options.handler = &_receiver;
+    if (brpc::StreamCreate(&streamId, stream_cntl, &stream_options) != 0) {
       LOG(ERROR) << "Fail to create stream";
       return -1;
     }
@@ -80,8 +163,29 @@ struct MmChannel {
     return 0;
   }
 
+
   int Write(butil::IOBuf & pkt) {
-      return brpc::StreamWrite(streamId, pkt);
+      int rc = 0;
+      while(!brpc::IsAskedToQuit()) {
+         rc = brpc::StreamWrite(streamId, pkt);
+         if (rc == EAGAIN) {
+            // wait until the stream is writable or an error occurred
+            WriteControl wctrl;
+            brpc::StreamWait(streamId, NULL, mm_channel_on_writable, &wctrl);
+            BAIDU_SCOPED_LOCK(wctrl.mu);
+            while(!wctrl.is_writable && !brpc::IsAskedToQuit()) {
+               wctrl.cv.Wait();
+            }
+            if (wctrl.error_code != 0) {
+		    LOG(ERROR) << "StreamWrite: error occurred: " << wctrl.error_code;
+		    break;
+	    }
+         } else {
+                  g_latency_recorder << stream_cntl.latency_us();
+                 break;
+         }
+      }
+      return rc;
   }
 };
 
@@ -123,11 +227,8 @@ static void* sender(void* arg) {
     }
     int rc = 0;
     do {
-      if (rc == EAGAIN)
-        sleep(0.01);
       rc = channel.Write(pkt);
-      g_latency_recorder << channel.stream_cntl.latency_us();
-    } while (rc == EAGAIN && !brpc::IsAskedToQuit());
+    } while (rc == 0 && !brpc::IsAskedToQuit());
     return 0;
   };
 
