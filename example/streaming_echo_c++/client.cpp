@@ -55,40 +55,15 @@ public:
 
     auto *iobuf = messages[0];
     uint64_t LSN = 0ULL;
-    uint32_t len = 0;
     int n = 0;
     char code[5];
     code[4] = '\0';
-    if (iobuf->size() >= 16) {
+    if (iobuf->size() == 12) {
       n = iobuf->cutn(code, 4);
-      n += iobuf->cutn(&len, 4);
       n += iobuf->cutn(&LSN, 8);
     }
-
-    size_t i = 0;
-    int data_size = 0;
-    std::string msg;
-    uint32_t curr_len = len;
-    while (i < size && iobuf->size() > 0 && curr_len > 0 && !brpc::IsAskedToQuit()) {
-      iobuf = messages[i];
-      uint32_t sz = std::min(curr_len, 128U);
-      std::string bufstr;
-      uint32_t cp_sz = iobuf->cutn(&bufstr, sz);
-      msg += bufstr;
-      data_size += cp_sz;
-      if (iobuf->size() == 0) {
-        ++i;
-      }
-      curr_len -= cp_sz;
-    }
-
-    _nreq << 1;
-#if 1
-    LOG(INFO)
-        << "Received from Stream=" << id << ": " << size << " LSN:" << LSN
-        << " len:" << len << " curr_len:"
-        << curr_len << " n:" << n << " " << code << ":[" << msg.substr(0,16) << "]";
-#endif
+    _nack << 1;
+    //LOG(INFO) << "Received ACK from Stream=" << id << " LSN:" << LSN << " " << code << " " <<  _nack.get_value();
     return 0;
   }
 
@@ -98,7 +73,7 @@ public:
   virtual void on_closed(brpc::StreamId id) {
     LOG(INFO) << "Stream=" << id << " is closed";
   }
-  bvar::Adder<size_t> _nreq;
+  bvar::Adder<size_t> _nack;
 };
 
   struct WriteControl {
@@ -130,6 +105,7 @@ struct MmChannel {
   StreamReceiver _receiver;
   butil::EndPoint pt;
   int id;
+  uint64_t LSN = 0;
 
   MmChannel() { } 
   ~MmChannel() { 
@@ -167,23 +143,21 @@ struct MmChannel {
   int Write(butil::IOBuf & pkt) {
       int rc = 0;
       while(!brpc::IsAskedToQuit()) {
-         rc = brpc::StreamWrite(streamId, pkt);
-         if (rc == EAGAIN) {
-            // wait until the stream is writable or an error occurred
-            WriteControl wctrl;
-            brpc::StreamWait(streamId, NULL, mm_channel_on_writable, &wctrl);
-            BAIDU_SCOPED_LOCK(wctrl.mu);
-            while(!wctrl.is_writable && !brpc::IsAskedToQuit()) {
-               wctrl.cv.Wait();
-            }
-            if (wctrl.error_code != 0) {
-		    LOG(ERROR) << "StreamWrite: error occurred: " << wctrl.error_code;
-		    break;
-	    }
-         } else {
-                  g_latency_recorder << stream_cntl.latency_us();
-                 break;
+         // wait until the stream is writable or an error occurred
+         WriteControl wctrl;
+         brpc::StreamWait(streamId, NULL, mm_channel_on_writable, &wctrl);
+         BAIDU_SCOPED_LOCK(wctrl.mu);
+         while(!wctrl.is_writable && !brpc::IsAskedToQuit()) {
+            wctrl.cv.Wait();
          }
+         if (wctrl.error_code != 0) {
+	         LOG(ERROR) << "StreamWrite: error occurred: " << wctrl.error_code;
+	         break;
+	 }
+         rc = brpc::StreamWrite(streamId, pkt);
+         g_latency_recorder << stream_cntl.latency_us();
+	 if (rc != EAGAIN)
+            break;
       }
       return rc;
   }
@@ -192,7 +166,6 @@ struct MmChannel {
 
 static void* sender(void* arg) {
     auto &channel = *static_cast<MmChannel*>(arg);
-    uint64_t LSN = 0ULL;
 
     do {
      channel.stream_cntl.Reset();
@@ -218,29 +191,25 @@ static void* sender(void* arg) {
     butil::IOBuf pkt;
     pkt.append(msg, 4);
     pkt.append(&len, sizeof(uint32_t));
-    pkt.append(&LSN, sizeof(uint64_t));
+    pkt.append(&channel.LSN, sizeof(uint64_t));
     uint32_t unit_size = 1024;
     while (!brpc::IsAskedToQuit() && len > 0) {
       uint32_t sz = std::min(len, unit_size);
       pkt.append(msg, sz);
       len -= sz;
     }
-    int rc = 0;
-    do {
-      rc = channel.Write(pkt);
-    } while (rc == 0 && !brpc::IsAskedToQuit());
-    return 0;
+    return channel.Write(pkt);
   };
 
   char page[1024 * 4 * 4];
   for (int i = 0; i < 16 * 1024; ++i)
      page[i] = 'A' + channel.id;
 
-  LOG(INFO) << "stream channel:" << channel.id << " " << page[0];
   uint32_t len = 0;
   while (!brpc::IsAskedToQuit()) {
-    ++LSN;
+    ++channel.LSN;
     uint32_t sz = std::min(len, (uint32_t)sizeof(page));
+    //LOG(INFO) << "stream channel:" << channel.id << " " << page[0] << " LSN:" << LSN << " size:" << sz;
     streaming(channel, page, sz);
     sleep(0.01);
     ++len;
@@ -300,6 +269,9 @@ int main(int argc, char *argv[]) {
        pthread_join(pids[i], NULL);
     else
        bthread_join(bids[i], NULL);
+  }
+  for (int i = 0; i < N; ++i) {
+     LOG(INFO) << channels[i].id << " streamID:" << channels[i].streamId << " LSN:" << channels[i].LSN;
   }
   return 0;
 }
