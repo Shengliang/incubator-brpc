@@ -27,7 +27,7 @@
 
 DEFINE_bool(send_attachment, true, "Carry attachment along with response");
 DEFINE_int32(port, 8114, "TCP Port of this server");
-DEFINE_int32(server_num, 26, "Number of servers");
+DEFINE_int32(server_num, 1, "Number of servers");
 DEFINE_bool(use_rdma, false, "use rdma or not");
 DEFINE_int32(idle_timeout_s, -1,
              "Connection will be closed if there is no "
