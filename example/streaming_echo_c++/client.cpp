@@ -24,11 +24,16 @@
 #include <brpc/stream.h>
 #include <bthread/bthread.h>
 #include <butil/logging.h>
+#include <butil/time/time.h>
 #include <butil/synchronization/condition_variable.h>
 #include "echo.pb.h"
 #include <gflags/gflags.h>
 #include <numeric>
 
+// Ping each other.
+// ./echo_client --server=0.0.0.0:8210 --port=8110
+// ./echo_client --server=0.0.0.0:8110 --port=8210
+//
 //int N = 26;
 int N = 5;
 DEFINE_int32(thread_num, N, "Number of threads to send requests");
@@ -109,14 +114,13 @@ class ServerStreamReceiver : public brpc::StreamInputHandler {
 public:
   int Write(brpc::StreamId streamId, butil::IOBuf & pkt) {
       int rc = EAGAIN;
-      const TimeDelta WAIT_TIME = TimeDelta::FromMilliseconds(800);
       while(!brpc::IsAskedToQuit()) {
           // wait until the stream is writable or an error occurred
           WriteControl wctrl;
           brpc::StreamWait(streamId, NULL, mm_channel_on_writable, &wctrl);
           BAIDU_SCOPED_LOCK(wctrl.mu);
           while(!wctrl.is_writable && !brpc::IsAskedToQuit()) {
-             wctrl.cv.TimedWait(WAIT_TIME);
+             wctrl.cv.Wait();
           }
           if (wctrl.error_code != 0) {
              // LOG(ERROR) << "StreamWrite: error occurred: " << wctrl.error_code;
@@ -300,7 +304,6 @@ static void* sender(void* arg) {
      if (channel.stream_cntl.Failed()) {
        LOG(ERROR) << "Fail to connect stream, " << channel.stream_cntl.ErrorText() << " port:" << channel.pt.port;
        g_error_count << 1;
-       sleep(1);
      } else {
        LOG(INFO) << "channel:" << channel.id << " port:" << channel.pt.port << " OK.";
        break;
@@ -363,9 +366,9 @@ static void* server_main(void* arg) {
 
   std::vector<size_t> last_num_requests(FLAGS_server_num);
   while(!brpc::IsAskedToQuit()) {
-     sleep(1);
      size_t cur_total = 0;
      for (int i = 0; i < FLAGS_server_num; ++i) {
+         int port = FLAGS_port + i;
          const size_t current_num_requests =
                  echo_service_impls[i].num_requests();
          const size_t current_num_errs =
@@ -375,7 +378,7 @@ static void* server_main(void* arg) {
          last_num_requests[i] = current_num_requests;
          auto LSN = echo_service_impls[i]._receiver.LSN;
 	 char * code = echo_service_impls[i]._receiver.code;
-         LOG(INFO) << "S[" << i << "]=" << diff << ' ' << current_num_errs << ' ' << LSN << ' ' << code << noflush;
+         LOG(INFO) << "Write[" << port << " Stream:" << echo_service_impls[i]._streamId << "]=" << diff << ' ' << current_num_errs << ' ' << LSN << ' ' << code << noflush;
          butil::IOBuf ack_pkt;
          ack_pkt.append(code, 4);
          ack_pkt.append(&LSN, sizeof(uint64_t));
