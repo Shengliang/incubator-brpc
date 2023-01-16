@@ -30,27 +30,33 @@
 #include <gflags/gflags.h>
 #include <numeric>
 
-// Ping each other.
-// ./echo_client --server=0.0.0.0:8210 --port=8110
-// ./echo_client --server=0.0.0.0:8110 --port=8210
-//
+/*Test
+ * one node
+  ./echo_client --server=0.0.0.0:8111 --thread_num=1 --port=8111 --seed=r
+
+ * 3 Nodes
+ ./echo_client --server=0.0.0.0:8111 --thread_num=3 --port=8111 --seed=a
+ ./echo_client --server=0.0.0.0:8111 --thread_num=3 --port=8112 --seed=A
+ ./echo_client --server=0.0.0.0:8111 --thread_num=3 --port=8113 --seed=r
+ */
 //int N = 26;
-int N = 5;
+int N = 1;
 DEFINE_int32(thread_num, N, "Number of threads to send requests");
 DEFINE_bool(use_bthread, false, "Use bthread to send requests");
 DEFINE_bool(send_attachment, true, "Carry attachment along with requests");
 DEFINE_string(connection_type, "", "Connection type. Available values: single, pooled, short");
 DEFINE_string(protocol, "baidu_std", "Protocol type. Defined in src/brpc/options.proto");
-//DEFINE_string(server, "10.231.229.157:8110", "IP Address of server, port + i");
-DEFINE_string(server, "0.0.0.0:8110", "IP Address of server, port + i");
+//DEFINE_string(server, "10.231.229.157:8100", "IP Address of server, port + i");
+DEFINE_string(server, "0.0.0.0:8100", "IP Address of server, port + i");
+DEFINE_string(seed, "AAAA", "Seed String");
 DEFINE_string(load_balancer, "rr", "Name of load balancer");
 DEFINE_int32(timeout_ms, 1000, "RPC timeout in milliseconds");
 DEFINE_int32(backup_ms, -1, "backup timeout in milliseconds");
 DEFINE_int32(max_retry, 3, "Max retries(not including the first RPC)");
 DEFINE_bool(use_rdma, false, "use rdma or not");
 
-DEFINE_int32(port, 8210, "TCP Port of this server");
-DEFINE_int32(server_num, N, "Number of servers");
+DEFINE_int32(port, 8200, "TCP Port of this server");
+DEFINE_int32(server_port_num, 1, "Number of server ports");
 DEFINE_int32(idle_timeout_s, -1,
              "Connection will be closed if there is no "
              "read/write operations during the last `idle_timeout_s'");
@@ -84,6 +90,7 @@ public:
   virtual int on_received_messages(brpc::StreamId id,
                                    butil::IOBuf *const messages[],
                                    size_t size) {
+    if (shutdown) return 0;
     if (size == 0)
       return 0;
 
@@ -97,29 +104,36 @@ public:
       n += iobuf->cutn(&LSN, 8);
     }
     _nack << 1;
-    //LOG(INFO) << "Received ACK from Stream=" << id << " LSN:" << LSN << " " << code << " " <<  _nack.get_value();
+    LOG(INFO) << "Client Received ACK from Stream=" << id << " port:" << m_port << " LSN:" << LSN << " " << code << " " <<  _nack.get_value();
     return 0;
   }
 
   virtual void on_idle_timeout(brpc::StreamId id) {
-    LOG(INFO) << "Stream=" << id << " has no data transmission for a while";
+    if (shutdown) return;
+    LOG(INFO) << "Client Stream=" << id << " has no data transmission for a while";
   }
   virtual void on_closed(brpc::StreamId id) {
-    LOG(INFO) << "Stream=" << id << " is closed";
+    if (shutdown) return;
+    LOG(INFO) << "Client Stream=" << id << " is closed port:" << m_port;
   }
   bvar::Adder<size_t> _nack;
+  int m_port;
+  brpc::StreamId m_stream_id;
+  void setPort(int port) { m_port = port; }
+  void setStreamId(brpc::StreamId streamId) { m_stream_id = streamId; }
+  bool shutdown = false;
 };
 
 class ServerStreamReceiver : public brpc::StreamInputHandler {
 public:
   int Write(brpc::StreamId streamId, butil::IOBuf & pkt) {
       int rc = EAGAIN;
-      while(!brpc::IsAskedToQuit()) {
+      while(!brpc::IsAskedToQuit() && !shutdown) {
           // wait until the stream is writable or an error occurred
           WriteControl wctrl;
           brpc::StreamWait(streamId, NULL, mm_channel_on_writable, &wctrl);
           BAIDU_SCOPED_LOCK(wctrl.mu);
-          while(!wctrl.is_writable && !brpc::IsAskedToQuit()) {
+          while(!wctrl.is_writable && !brpc::IsAskedToQuit() && !shutdown) {
              wctrl.cv.Wait();
           }
           if (wctrl.error_code != 0) {
@@ -127,6 +141,7 @@ public:
              g_error_count << 1;
              break;
 	  }
+	  if (shutdown) break;
           rc = brpc::StreamWrite(streamId, pkt);
           if (rc != EAGAIN) break;
       }
@@ -135,6 +150,7 @@ public:
   virtual int on_received_messages(brpc::StreamId streamId,
                                    butil::IOBuf *const messages[],
                                    size_t size) {
+    if (shutdown) return 0;
     if (size == 0)
       return 0;
     auto *iobuf = messages[0];
@@ -150,7 +166,7 @@ public:
     int data_size = 0;
     std::string msg;
     uint32_t curr_len = len;
-    while (i < size && iobuf->size() > 0 && curr_len > 0 && !brpc::IsAskedToQuit()) {
+    while (i < size && iobuf->size() > 0 && curr_len > 0 && !brpc::IsAskedToQuit() && !shutdown) {
       iobuf = messages[i];
       uint32_t sz = std::min(curr_len, 128U);
       std::string bufstr;
@@ -164,9 +180,10 @@ public:
     }
 
     _nreq << 1;
-#if 0
+    if(shutdown) return 0;
+#if 1
     LOG(INFO)
-        << "Received from Stream=" << streamId << ": " << size << " LSN:" << LSN
+        << "Server Received from Stream=" << m_stream_id << "," << streamId << " port:" << m_port << " " << size << " LSN:" << LSN
         << " len:" << len << " curr_len:"
         << curr_len << " n:" << n << " " << code << ":[" << msg.substr(0,16) << "]";
 #endif
@@ -174,23 +191,40 @@ public:
     return 0;
   }
   virtual void on_idle_timeout(brpc::StreamId streamId) {
-    LOG(INFO) << "Stream=" << streamId << " has no data transmission for a while";
+    if (shutdown) return;
+    LOG(INFO) << "Server Stream=" << streamId << " has no data transmission for a while";
   }
   virtual void on_closed(brpc::StreamId streamId) {
-    LOG(INFO) << "Stream=" << streamId << " is closed";
+    if (shutdown) return;
+    LOG(INFO) << "Server Stream=" << streamId << " is closed. port:" << m_port << " stream_id:" << m_stream_id;
   }
   bvar::Adder<size_t> _nreq;
   bvar::Adder<size_t> _nerr;
   uint64_t LSN = 0ULL;
   uint32_t len = 0;
   char code[5];
+  int m_port;
+  brpc::StreamId m_stream_id;
+  void setPort(int port) { m_port = port; }
+  void setStreamId(brpc::StreamId streamId) { m_stream_id = streamId; }
+  bool shutdown = false;
 };
 
 // Your implementation of example::EchoService
 class StreamingEchoService : public example::EchoService {
 public:
+  void setPort(int port) { _receiver.setPort(port); };
   StreamingEchoService() : _streamId(brpc::INVALID_STREAM_ID){};
-  virtual ~StreamingEchoService() { brpc::StreamClose(_streamId); };
+  virtual ~StreamingEchoService() {
+      Shutdown();
+  };
+  void Shutdown() {
+      if (shutdown_done) return;
+      _receiver.shutdown = true;
+      LOG(INFO) << "Shutdown Port:" << _receiver.m_port << " stream:" << _streamId << " closed.";
+      brpc::StreamClose(_streamId);
+      shutdown_done = true;
+  }
   virtual void Echo(google::protobuf::RpcController *controller,
                     const example::EchoRequest * /*request*/,
                     example::EchoResponse *response,
@@ -207,7 +241,8 @@ public:
       return;
     }
     response->set_message("Accepted stream");
-    LOG(INFO) << "Accepted Stream=" << _streamId;
+    LOG(INFO) << "Server Service: Accepted Stream=" << _streamId;
+    _receiver.setStreamId(_streamId);
   }
   size_t num_requests() const { return _receiver._nreq.get_value(); }
   size_t num_errors() const { return _receiver._nerr.get_value(); }
@@ -215,11 +250,12 @@ public:
   ServerStreamReceiver _receiver;
   brpc::StreamId _streamId;
 private:
+  bool shutdown_done = false;
 };
 
 
 
-struct MmChannel {
+struct StreamChannel {
   // A Channel represents a communication line to a Server. Notice that
   // Channel is thread-safe and can be shared by all threads in your program.
   brpc::Channel channel;
@@ -232,11 +268,12 @@ struct MmChannel {
   int id;
   uint64_t LSN = 0;
 
-  MmChannel() { } 
-  ~MmChannel() { 
-    CHECK_EQ(0, brpc::StreamClose(streamId));
+  StreamChannel() { }
+  ~StreamChannel() {
+    _receiver.shutdown = true;
     LOG(INFO) << "EchoClient is going to quit:" << streamId;
-  } 
+    CHECK_EQ(0, brpc::StreamClose(streamId));
+  }
 
   void SetEndPoint(int id, butil::EndPoint pt) {
     this->id = id;
@@ -254,13 +291,15 @@ struct MmChannel {
        return -1;
     }
 
+    _receiver.setPort(pt.port);
     stream_options.handler = &_receiver;
     if (brpc::StreamCreate(&streamId, stream_cntl, &stream_options) != 0) {
       LOG(ERROR) << "Fail to create stream at port:" << pt.port;
       return -1;
     }
-    LOG(INFO) << "Created Stream=" << streamId << " at port:" << pt.port;
 
+    LOG(INFO) << "Created Stream=" << streamId << " at port:" << pt.port;
+    _receiver.setStreamId(streamId);
     return 0;
   }
 
@@ -276,7 +315,7 @@ struct MmChannel {
             wctrl.cv.Wait();
          }
          if (wctrl.error_code != 0) {
-	         LOG(ERROR) << "StreamWrite: error occurred: " << wctrl.error_code;
+	         //LOG(ERROR) << "StreamWrite: error occurred: " << wctrl.error_code;
 	         break;
 	 }
          rc = brpc::StreamWrite(streamId, pkt);
@@ -290,8 +329,9 @@ struct MmChannel {
 
 
 static void* sender(void* arg) {
-    auto &channel = *static_cast<MmChannel*>(arg);
+    auto &channel = *static_cast<StreamChannel*>(arg);
 
+    int cnt = 1000000;
     do {
      channel.stream_cntl.Reset();
      channel.Init();
@@ -303,15 +343,16 @@ static void* sender(void* arg) {
      stub.Echo(&channel.stream_cntl, &request, &response, NULL);
      if (channel.stream_cntl.Failed()) {
        LOG(ERROR) << "Fail to connect stream, " << channel.stream_cntl.ErrorText() << " port:" << channel.pt.port;
+       sleep(1);
        g_error_count << 1;
      } else {
        LOG(INFO) << "channel:" << channel.id << " port:" << channel.pt.port << " OK.";
        break;
      }
-    } while (channel.stream_cntl.Failed() && !brpc::IsAskedToQuit());
+    } while (--cnt && channel.stream_cntl.Failed() && !brpc::IsAskedToQuit());
 
 
-  auto streaming = [&](MmChannel & channel, void const *msg, uint32_t len) -> int {
+  auto streaming = [&](StreamChannel & channel, void const *msg, uint32_t len) -> int {
     butil::IOBuf pkt;
     pkt.append(msg, 4);
     pkt.append(&len, sizeof(uint32_t));
@@ -327,7 +368,7 @@ static void* sender(void* arg) {
 
   char page[1024 * 4 * 4];
   for (int i = 0; i < 16 * 1024; ++i)
-     page[i] = 'A' + channel.id;
+     page[i] = FLAGS_seed.c_str()[0] + channel.id;
 
   uint32_t len = 0;
   while (!brpc::IsAskedToQuit()) {
@@ -335,21 +376,23 @@ static void* sender(void* arg) {
     uint32_t sz = std::min(len, (uint32_t)sizeof(page));
     //LOG(INFO) << "stream channel:" << channel.id << " " << page[0] << " LSN:" << LSN << " size:" << sz;
     streaming(channel, page, sz);
-    sleep(0.01);
+    sleep(1);
     ++len;
     len %= 1024;
   }
+  LOG(INFO) << "client sender quit:" << channel.pt.port ;
   return NULL;
 }
 
 static void* server_main(void* arg) {
 
-  brpc::Server* servers = new brpc::Server[FLAGS_server_num];
-  StreamingEchoService* echo_service_impls = new StreamingEchoService[FLAGS_server_num];
+  brpc::Server* servers = new brpc::Server[FLAGS_server_port_num];
+  StreamingEchoService* echo_service_impls = new StreamingEchoService[FLAGS_server_port_num];
 
-  for (int i = 0; i < FLAGS_server_num; ++i) {
+  for (int i = 0; i < FLAGS_server_port_num; ++i) {
      int port = FLAGS_port + i;
-     servers[i].set_version(butil::string_printf("example/streaming_echo_c++[%d]", i)); 
+     echo_service_impls[i].setPort(port);
+     servers[i].set_version(butil::string_printf("example/streaming_echo_c++[%d]", i));
      if (servers[i].AddService(&echo_service_impls[i], brpc::SERVER_DOESNT_OWN_SERVICE) != 0) {
        LOG(ERROR) << "Fail to add service @port:" << port;
        return NULL;
@@ -364,10 +407,11 @@ static void* server_main(void* arg) {
      LOG(INFO) << " Start echo server at port:" << port;
   }
 
-  std::vector<size_t> last_num_requests(FLAGS_server_num);
+  std::vector<size_t> last_num_requests(FLAGS_server_port_num);
   while(!brpc::IsAskedToQuit()) {
+     sleep(1);
      size_t cur_total = 0;
-     for (int i = 0; i < FLAGS_server_num; ++i) {
+     for (int i = 0; i < FLAGS_server_port_num; ++i) {
          int port = FLAGS_port + i;
          const size_t current_num_requests =
                  echo_service_impls[i].num_requests();
@@ -387,21 +431,30 @@ static void* server_main(void* arg) {
      }
      LOG(INFO) << "[total=" << cur_total << ']';
   }
-  for (int i = 0; i < FLAGS_server_num; ++i) {
+  for (int i = 0; i < FLAGS_server_port_num; ++i) {
+     int port = FLAGS_port + i;
+     echo_service_impls[i].Shutdown();
+     servers[i].RunUntilAskedToQuit();
+     LOG(INFO) << "port quit:" << port;
+  }
+  /*
+  for (int i = 0; i < FLAGS_server_port_num; ++i) {
 	  servers[i].Stop(FLAGS_logoff_ms);
   }
-  for (int i = 0; i < FLAGS_server_num; ++i) {
+  for (int i = 0; i < FLAGS_server_port_num; ++i) {
 	  servers[i].Join();
   }
+  */
 
   delete [] servers;
   delete [] echo_service_impls;
+  LOG(INFO) << "server main quit";
   return NULL;
 }
 
 static void* client_main(void* arg) {
   N = FLAGS_thread_num;
-  std::vector<MmChannel> channels(N);
+  std::vector<StreamChannel> channels(N);
   butil::EndPoint pt;
 
     if (str2endpoint(FLAGS_server.c_str(), &pt) != 0 &&
