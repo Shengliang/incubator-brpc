@@ -225,10 +225,10 @@ public:
       brpc::StreamClose(_streamId);
       shutdown_done = true;
   }
-  virtual void Echo(google::protobuf::RpcController *controller,
+  void OpenStream(google::protobuf::RpcController *controller,
                     const example::EchoRequest * /*request*/,
                     example::EchoResponse *response,
-                    google::protobuf::Closure *done) {
+                    google::protobuf::Closure *done) override {
     // This object helps you to call done->Run() in RAII style. If you need
     // to process the request asynchronously, pass done_guard.release().
     brpc::ClosureGuard done_guard(done);
@@ -244,13 +244,21 @@ public:
     LOG(INFO) << "Server Service: Accepted Stream=" << _streamId;
     _receiver.setStreamId(_streamId);
   }
+  void CloseStream(google::protobuf::RpcController *controller,
+                    const example::EchoRequest * /*request*/,
+                    example::EchoResponse *response,
+                    google::protobuf::Closure *done) override {
+    brpc::ClosureGuard done_guard(done);
+    LOG(INFO) << "Server Service: Close Stream=" << _streamId;
+    Shutdown();
+  }
   size_t num_requests() const { return _receiver._nreq.get_value(); }
   size_t num_errors() const { return _receiver._nerr.get_value(); }
 
   ServerStreamReceiver _receiver;
   brpc::StreamId _streamId;
-private:
   bool shutdown_done = false;
+private:
 };
 
 
@@ -340,7 +348,7 @@ static void* sender(void* arg) {
      example::EchoResponse response;
      request.set_message("I'm a RPC to connect stream");
      example::EchoService_Stub stub(&channel.channel);
-     stub.Echo(&channel.stream_cntl, &request, &response, NULL);
+     stub.OpenStream(&channel.stream_cntl, &request, &response, NULL);
      if (channel.stream_cntl.Failed()) {
        LOG(ERROR) << "Fail to connect stream, " << channel.stream_cntl.ErrorText() << " port:" << channel.pt.port;
        sleep(1);
@@ -381,6 +389,13 @@ static void* sender(void* arg) {
     len %= 1024;
   }
   LOG(INFO) << "client sender quit:" << channel.pt.port ;
+  {
+     example::EchoRequest request;
+     example::EchoResponse response;
+     request.set_message("I'm a RPC to close the stream");
+     example::EchoService_Stub stub(&channel.channel);
+     stub.CloseStream(&channel.stream_cntl, &request, &response, NULL);
+  }
   return NULL;
 }
 
@@ -408,10 +423,15 @@ static void* server_main(void* arg) {
   }
 
   std::vector<size_t> last_num_requests(FLAGS_server_port_num);
-  while(!brpc::IsAskedToQuit()) {
+  bool done = false;
+  while(!brpc::IsAskedToQuit() && !done) {
      sleep(1);
      size_t cur_total = 0;
      for (int i = 0; i < FLAGS_server_port_num; ++i) {
+         if (echo_service_impls[i].shutdown_done) {
+	     done = true;
+	     break;
+	 }
          int port = FLAGS_port + i;
          const size_t current_num_requests =
                  echo_service_impls[i].num_requests();
@@ -431,11 +451,12 @@ static void* server_main(void* arg) {
      }
      LOG(INFO) << "[total=" << cur_total << ']';
   }
+
   for (int i = 0; i < FLAGS_server_port_num; ++i) {
      int port = FLAGS_port + i;
      echo_service_impls[i].Shutdown();
      servers[i].RunUntilAskedToQuit();
-     LOG(INFO) << "port quit:" << port;
+     LOG(INFO) << "Server port quit:" << port;
   }
   /*
   for (int i = 0; i < FLAGS_server_port_num; ++i) {
@@ -448,7 +469,7 @@ static void* server_main(void* arg) {
 
   delete [] servers;
   delete [] echo_service_impls;
-  LOG(INFO) << "server main quit";
+  LOG(INFO) << "Server main quit." << done;
   return NULL;
 }
 
@@ -501,7 +522,7 @@ static void* client_main(void* arg) {
        bthread_join(bids[i], NULL);
   }
   for (int i = 0; i < N; ++i) {
-     LOG(INFO) << channels[i].id << " streamID:" << channels[i].streamId << " LSN:" << channels[i].LSN;
+     LOG(INFO) << "Client:" << channels[i].id << " streamID:" << channels[i].streamId << " LSN:" << channels[i].LSN;
   }
   return NULL;
 }
