@@ -39,6 +39,8 @@
  ./echo_client --server=0.0.0.0:8111 --thread_num=3 --port=8112 --seed=A
  ./echo_client --server=0.0.0.0:8111 --thread_num=3 --port=8113 --seed=r
  */
+static std::atomic<int> client_done_cnt;
+static std::atomic<int> server_done_cnt;
 //int N = 26;
 int N = 1;
 DEFINE_int32(thread_num, N, "Number of threads to send requests");
@@ -251,6 +253,7 @@ public:
     brpc::ClosureGuard done_guard(done);
     LOG(INFO) << "Server Service: Close Stream=" << _streamId;
     Shutdown();
+    server_done_cnt.fetch_add(1);
   }
   size_t num_requests() const { return _receiver._nreq.get_value(); }
   size_t num_errors() const { return _receiver._nerr.get_value(); }
@@ -263,10 +266,9 @@ private:
 
 
 
-struct StreamChannel {
+struct StreamChannel :  public ::brpc::Channel {
   // A Channel represents a communication line to a Server. Notice that
   // Channel is thread-safe and can be shared by all threads in your program.
-  brpc::Channel channel;
   brpc::StreamId streamId;
   brpc::Controller stream_cntl;
   brpc::ChannelOptions sch_options;
@@ -294,7 +296,8 @@ struct StreamChannel {
     sch_options.backup_request_ms = FLAGS_backup_ms;
     sch_options.max_retry = FLAGS_max_retry;
     sch_options.use_rdma = FLAGS_use_rdma;
-    if (channel.Init(pt, &sch_options) != 0) {
+    int error = ::brpc::Channel::Init(pt, &sch_options);
+    if (error != 0) {
        LOG(ERROR) << "Fail to initialize channel at port:" << pt.port;
        return -1;
     }
@@ -327,7 +330,7 @@ struct StreamChannel {
 	         break;
 	 }
          rc = brpc::StreamWrite(streamId, pkt);
-         g_latency_recorder << stream_cntl.latency_us();
+	 g_latency_recorder << stream_cntl.latency_us();
 	 if (rc != EAGAIN)
             break;
       }
@@ -347,7 +350,7 @@ static void* sender(void* arg) {
      example::EchoRequest request;
      example::EchoResponse response;
      request.set_message("I'm a RPC to connect stream");
-     example::EchoService_Stub stub(&channel.channel);
+     example::EchoService_Stub stub(&channel);
      stub.OpenStream(&channel.stream_cntl, &request, &response, NULL);
      if (channel.stream_cntl.Failed()) {
        LOG(ERROR) << "Fail to connect stream, " << channel.stream_cntl.ErrorText() << " port:" << channel.pt.port;
@@ -357,7 +360,7 @@ static void* sender(void* arg) {
        LOG(INFO) << "channel:" << channel.id << " port:" << channel.pt.port << " OK.";
        break;
      }
-    } while (--cnt && channel.stream_cntl.Failed() && !brpc::IsAskedToQuit());
+    } while (--cnt && !brpc::IsAskedToQuit());
 
 
   auto streaming = [&](StreamChannel & channel, void const *msg, uint32_t len) -> int {
@@ -393,9 +396,11 @@ static void* sender(void* arg) {
      example::EchoRequest request;
      example::EchoResponse response;
      request.set_message("I'm a RPC to close the stream");
-     example::EchoService_Stub stub(&channel.channel);
+     channel.stream_cntl.Reset();
+     example::EchoService_Stub stub(&channel);
      stub.CloseStream(&channel.stream_cntl, &request, &response, NULL);
   }
+  client_done_cnt.fetch_add(1);
   return NULL;
 }
 
@@ -470,6 +475,7 @@ static void* server_main(void* arg) {
   delete [] servers;
   delete [] echo_service_impls;
   LOG(INFO) << "Server main quit." << done;
+  server_done_cnt.fetch_add(1);
   return NULL;
 }
 
@@ -510,7 +516,7 @@ static void* client_main(void* arg) {
      }
   }
 
-  while (!brpc::IsAskedToQuit()) {
+  while (!brpc::IsAskedToQuit() && client_done_cnt.load() == 0 && server_done_cnt.load() == 0) {
       sleep(1);
       LOG(INFO) << "Sending EchoRequest at qps=" << g_latency_recorder.qps(1) << " latency=" << g_latency_recorder.latency(1);
   }
