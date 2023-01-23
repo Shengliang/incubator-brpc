@@ -29,6 +29,9 @@
 #include "echo.pb.h"
 #include <gflags/gflags.h>
 #include <numeric>
+#include <queue>
+#include <utility>
+#include <unordered_map>
 
 /*Test
  * one node
@@ -41,6 +44,32 @@
  */
 static std::atomic<int> client_done_cnt;
 static std::atomic<int> server_done_cnt;
+struct queue_elem_type {
+    brpc::StreamId stream_id;
+    butil::IOBuf* iobuf;
+    queue_elem_type(brpc::StreamId id = brpc::INVALID_STREAM_ID, butil::IOBuf *const iobuf_ = nullptr) : stream_id(id) {
+        iobuf = new butil::IOBuf(*iobuf_);
+        LOG(INFO) << "new " << iobuf;
+    }
+    ~queue_elem_type() {
+       if (iobuf != nullptr) {
+         LOG(INFO) << "delete " << iobuf;
+         delete iobuf;
+	 iobuf = nullptr;
+       }
+       stream_id = brpc::INVALID_STREAM_ID;
+    }
+    /* Support move operator only */
+    queue_elem_type& operator=(queue_elem_type&& other) {
+	    this->~queue_elem_type();
+	    std::swap(iobuf, other.iobuf);
+	    std::swap(stream_id, other.stream_id);
+	    return *this;
+    }
+    queue_elem_type(const queue_elem_type&other) = delete;
+    queue_elem_type& operator=(const queue_elem_type& other) = delete;
+};
+
 //int N = 26;
 int N = 1;
 DEFINE_int32(thread_num, N, "Number of threads to send requests");
@@ -88,15 +117,36 @@ void mm_channel_on_writable(brpc::StreamId, void* arg, int error_code) {
 };
 
 class StreamReceiver : public brpc::StreamInputHandler {
+	std::unordered_set<brpc::StreamId> rx_stream_ids;
 public:
-  virtual int on_received_messages(brpc::StreamId id,
+  virtual int on_received_messages(brpc::StreamId streamId,
                                    butil::IOBuf *const messages[],
                                    size_t size) {
     if (shutdown) return 0;
     if (size == 0)
       return 0;
+    rx_stream_ids.insert(streamId);
+    for (size_t i = 0; i < size; ++i) {
+        std::unique_ptr<queue_elem_type> p(new queue_elem_type(streamId, messages[i]));
+        incoming_queue.push(std::move(p));
+    }
+    return 0;
+  }
 
-    auto *iobuf = messages[0];
+  std::unique_ptr<queue_elem_type> read() {
+    if (incoming_queue.empty()) return nullptr;
+    auto p = std::move(incoming_queue.front());
+    incoming_queue.pop();
+    return p;
+  }
+
+  int process() {
+    auto p = read();
+    if (p == nullptr) return 0;
+    auto streamId = p->stream_id;
+    auto iobuf = p->iobuf;
+    if (iobuf == nullptr) return 0;
+
     uint64_t LSN = 0ULL;
     int n = 0;
     char code[5];
@@ -106,7 +156,7 @@ public:
       n += iobuf->cutn(&LSN, 8);
     }
     _nack << 1;
-    LOG(INFO) << "Client Received ACK from Stream=" << id << " port:" << m_port << " LSN:" << LSN << " " << code << " " <<  _nack.get_value();
+    LOG(INFO) << "Client Received ACK from Stream=" << streamId << "," << m_stream_id << " port:" << m_port << " LSN:" << LSN << " " << code << " " <<  _nack.get_value();
     return 0;
   }
 
@@ -124,9 +174,11 @@ public:
   void setPort(int port) { m_port = port; }
   void setStreamId(brpc::StreamId streamId) { m_stream_id = streamId; }
   bool shutdown = false;
+  std::queue<std::unique_ptr<queue_elem_type>> incoming_queue;
 };
 
 class ServerStreamReceiver : public brpc::StreamInputHandler {
+	std::unordered_set<brpc::StreamId> rx_stream_ids;
 public:
   int Write(brpc::StreamId streamId, butil::IOBuf & pkt) {
       int rc = EAGAIN;
@@ -155,7 +207,26 @@ public:
     if (shutdown) return 0;
     if (size == 0)
       return 0;
-    auto *iobuf = messages[0];
+    rx_stream_ids.insert(streamId);
+    for (size_t i = 0; i < size; ++i) {
+        std::unique_ptr<queue_elem_type> p(new queue_elem_type(streamId, messages[i]));
+        incoming_queue.push(std::move(p));
+    }
+    return 0;
+
+  }
+
+  std::unique_ptr<queue_elem_type> read() {
+    if (incoming_queue.empty()) return nullptr;
+    auto p = std::move(incoming_queue.front());
+    incoming_queue.pop();
+    return p;
+  }
+
+  int process() {
+    auto p = read();
+    if (p == nullptr) return 0;
+    auto iobuf = p->iobuf;
     int n = 0;
     code[4] = '\0';
     if (iobuf->size() >= 16) {
@@ -163,31 +234,20 @@ public:
       n += iobuf->cutn(&len, 4);
       n += iobuf->cutn(&LSN, 8);
     }
-
-    size_t i = 0;
-    int data_size = 0;
-    std::string msg;
-    uint32_t curr_len = len;
-    while (i < size && iobuf->size() > 0 && curr_len > 0 && !brpc::IsAskedToQuit() && !shutdown) {
-      iobuf = messages[i];
-      uint32_t sz = std::min(curr_len, 128U);
-      std::string bufstr;
-      uint32_t cp_sz = iobuf->cutn(&bufstr, sz);
-      msg += bufstr;
-      data_size += cp_sz;
-      if (iobuf->size() == 0) {
-        ++i;
-      }
-      curr_len -= cp_sz;
+    while (p != nullptr && !brpc::IsAskedToQuit() && !shutdown) {
+         p = read();
     }
 
     _nreq << 1;
     if(shutdown) return 0;
 #if 1
+    std::stringstream ss;
+    for(auto id:rx_stream_ids) {
+	    ss << id << " ";
+    }
     LOG(INFO)
-        << "Server Received from Stream=" << m_stream_id << "," << streamId << " port:" << m_port << " " << size << " LSN:" << LSN
-        << " len:" << len << " curr_len:"
-        << curr_len << " n:" << n << " " << code << ":[" << msg.substr(0,16) << "]";
+        << "Server Received from Stream=" << m_stream_id << " port:" << m_port << " " << " LSN:" << LSN
+        << " len:" << len << " n:" << n << " " << code << " stream_ids:" << ss.str();
 #endif
 
     return 0;
@@ -210,21 +270,23 @@ public:
   void setPort(int port) { m_port = port; }
   void setStreamId(brpc::StreamId streamId) { m_stream_id = streamId; }
   bool shutdown = false;
+  std::queue<std::unique_ptr<queue_elem_type>> incoming_queue;
 };
 
 // Your implementation of example::EchoService
 class StreamingEchoService : public example::EchoService {
 public:
+  brpc::StreamOptions _stream_options;
   void setPort(int port) { _receiver.setPort(port); };
-  StreamingEchoService() : _streamId(brpc::INVALID_STREAM_ID){};
+  StreamingEchoService() {};
   virtual ~StreamingEchoService() {
       Shutdown();
   };
   void Shutdown() {
       if (shutdown_done) return;
       _receiver.shutdown = true;
-      LOG(INFO) << "Shutdown Port:" << _receiver.m_port << " stream:" << _streamId << " closed.";
-      brpc::StreamClose(_streamId);
+      LOG(INFO) << "Shutdown Port:" << _receiver.m_port << " stream:" << _receiver.m_stream_id << " closed.";
+      brpc::StreamClose(_receiver.m_stream_id);
       shutdown_done = true;
   }
   void OpenStream(google::protobuf::RpcController *controller,
@@ -236,22 +298,21 @@ public:
     brpc::ClosureGuard done_guard(done);
 
     brpc::Controller *cntl = static_cast<brpc::Controller *>(controller);
-    brpc::StreamOptions stream_options;
-    stream_options.handler = &_receiver;
-    if (brpc::StreamAccept(&_streamId, *cntl, &stream_options) != 0) {
+    _stream_options.handler = &_receiver;
+    if (brpc::StreamAccept(&_receiver.m_stream_id, *cntl, &_stream_options) != 0) {
       cntl->SetFailed("Fail to accept stream");
       return;
     }
     response->set_message("Accepted stream");
-    LOG(INFO) << "Server Service: Accepted Stream=" << _streamId;
-    _receiver.setStreamId(_streamId);
+    LOG(INFO) << "Server Service: Accepted Stream=" << _receiver.m_stream_id;
+
   }
   void CloseStream(google::protobuf::RpcController *controller,
                     const example::EchoRequest * /*request*/,
                     example::EchoResponse *response,
                     google::protobuf::Closure *done) override {
     brpc::ClosureGuard done_guard(done);
-    LOG(INFO) << "Server Service: Close Stream=" << _streamId;
+    LOG(INFO) << "Server Service: Close Stream=" << _receiver.m_stream_id;
     Shutdown();
     server_done_cnt.fetch_add(1);
   }
@@ -259,7 +320,6 @@ public:
   size_t num_errors() const { return _receiver._nerr.get_value(); }
 
   ServerStreamReceiver _receiver;
-  brpc::StreamId _streamId;
   bool shutdown_done = false;
 private:
 };
@@ -308,9 +368,9 @@ struct StreamChannel :  public ::brpc::Channel {
       LOG(ERROR) << "Fail to create stream at port:" << pt.port;
       return -1;
     }
+    _receiver.setStreamId(streamId);
 
     LOG(INFO) << "Created Stream=" << streamId << " at port:" << pt.port;
-    _receiver.setStreamId(streamId);
     return 0;
   }
 
@@ -326,8 +386,8 @@ struct StreamChannel :  public ::brpc::Channel {
             wctrl.cv.Wait();
          }
          if (wctrl.error_code != 0) {
-	         //LOG(ERROR) << "StreamWrite: error occurred: " << wctrl.error_code;
-	         break;
+              //LOG(ERROR) << "StreamWrite: error occurred: " << wctrl.error_code;
+              break;
 	 }
          rc = brpc::StreamWrite(streamId, pkt);
 	 g_latency_recorder << stream_cntl.latency_us();
@@ -385,7 +445,8 @@ static void* sender(void* arg) {
   while (!brpc::IsAskedToQuit()) {
     ++channel.LSN;
     uint32_t sz = std::min(len, (uint32_t)sizeof(page));
-    //LOG(INFO) << "stream channel:" << channel.id << " " << page[0] << " LSN:" << LSN << " size:" << sz;
+    channel._receiver.process();
+    LOG(INFO) << "stream channel:" << channel.id << " " << page[0] << " LSN:" << channel.LSN << " size:" << sz;
     streaming(channel, page, sz);
     sleep(1);
     ++len;
@@ -447,12 +508,13 @@ static void* server_main(void* arg) {
          last_num_requests[i] = current_num_requests;
          auto LSN = echo_service_impls[i]._receiver.LSN;
 	 char * code = echo_service_impls[i]._receiver.code;
-         LOG(INFO) << "Write[" << port << " Stream:" << echo_service_impls[i]._streamId << "]=" << diff << ' ' << current_num_errs << ' ' << LSN << ' ' << code << noflush;
+         LOG(INFO) << "Write[" << port << " Stream:" << echo_service_impls[i]._receiver.m_stream_id << "]=" << diff << ' ' << current_num_errs << ' ' << LSN << ' ' << code << noflush;
          butil::IOBuf ack_pkt;
          ack_pkt.append(code, 4);
          ack_pkt.append(&LSN, sizeof(uint64_t));
-         int rc = echo_service_impls[i]._receiver.Write(echo_service_impls[i]._streamId, ack_pkt);
+         int rc = echo_service_impls[i]._receiver.Write(echo_service_impls[i]._receiver.m_stream_id, ack_pkt);
          if (rc != 0) echo_service_impls[i]._receiver._nerr << 1;
+         echo_service_impls[i]._receiver.process();
      }
      LOG(INFO) << "[total=" << cur_total << ']';
   }
