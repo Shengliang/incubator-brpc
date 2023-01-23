@@ -69,6 +69,9 @@ struct queue_elem_type {
     queue_elem_type(const queue_elem_type&other) = delete;
     queue_elem_type& operator=(const queue_elem_type& other) = delete;
 };
+using  queue_type = std::queue<std::unique_ptr<queue_elem_type>>;
+
+
 
 //int N = 26;
 int N = 1;
@@ -119,6 +122,11 @@ void mm_channel_on_writable(brpc::StreamId, void* arg, int error_code) {
 class StreamReceiver : public brpc::StreamInputHandler {
 	std::unordered_set<brpc::StreamId> rx_stream_ids;
 public:
+	~StreamReceiver() {
+               for(auto & e : queue_pool) {
+		       delete e.second;
+	       }
+	}
   virtual int on_received_messages(brpc::StreamId streamId,
                                    butil::IOBuf *const messages[],
                                    size_t size) {
@@ -126,17 +134,19 @@ public:
     if (size == 0)
       return 0;
     rx_stream_ids.insert(streamId);
+    auto * incoming_queue = get_queue(0);
     for (size_t i = 0; i < size; ++i) {
         std::unique_ptr<queue_elem_type> p(new queue_elem_type(streamId, messages[i]));
-        incoming_queue.push(std::move(p));
+        incoming_queue->push(std::move(p));
     }
     return 0;
   }
 
   std::unique_ptr<queue_elem_type> read() {
-    if (incoming_queue.empty()) return nullptr;
-    auto p = std::move(incoming_queue.front());
-    incoming_queue.pop();
+    auto *incoming_queue = get_queue(0);
+    if (incoming_queue->empty()) return nullptr;
+    auto p = std::move(incoming_queue->front());
+    incoming_queue->pop();
     return p;
   }
 
@@ -174,12 +184,19 @@ public:
   void setPort(int port) { m_port = port; }
   void setStreamId(brpc::StreamId streamId) { m_stream_id = streamId; }
   bool shutdown = false;
-  std::queue<std::unique_ptr<queue_elem_type>> incoming_queue;
+  std::unordered_map<uint64_t, queue_type*> queue_pool;
+  queue_type* get_queue(uint64_t key) { return queue_pool[key]; };
+  void register_queue(uint64_t key, queue_type* q) { queue_pool[key] = q; };
 };
 
 class ServerStreamReceiver : public brpc::StreamInputHandler {
 	std::unordered_set<brpc::StreamId> rx_stream_ids;
 public:
+	~ServerStreamReceiver() {
+               for(auto & e : queue_pool) {
+		       delete e.second;
+	       }
+	}
   int Write(brpc::StreamId streamId, butil::IOBuf & pkt) {
       int rc = EAGAIN;
       while(!brpc::IsAskedToQuit() && !shutdown) {
@@ -207,19 +224,20 @@ public:
     if (shutdown) return 0;
     if (size == 0)
       return 0;
+    auto * incoming_queue = get_queue(0);
     rx_stream_ids.insert(streamId);
     for (size_t i = 0; i < size; ++i) {
         std::unique_ptr<queue_elem_type> p(new queue_elem_type(streamId, messages[i]));
-        incoming_queue.push(std::move(p));
+        incoming_queue->push(std::move(p));
     }
     return 0;
-
   }
 
   std::unique_ptr<queue_elem_type> read() {
-    if (incoming_queue.empty()) return nullptr;
-    auto p = std::move(incoming_queue.front());
-    incoming_queue.pop();
+    auto *incoming_queue = get_queue(0);
+    if (incoming_queue->empty()) return nullptr;
+    auto p = std::move(incoming_queue->front());
+    incoming_queue->pop();
     return p;
   }
 
@@ -270,7 +288,9 @@ public:
   void setPort(int port) { m_port = port; }
   void setStreamId(brpc::StreamId streamId) { m_stream_id = streamId; }
   bool shutdown = false;
-  std::queue<std::unique_ptr<queue_elem_type>> incoming_queue;
+  std::unordered_map<uint64_t, queue_type*> queue_pool;
+  queue_type* get_queue(uint64_t key) { return queue_pool[key]; };
+  void register_queue(uint64_t key, queue_type* q) { queue_pool[key] = q; };
 };
 
 // Your implementation of example::EchoService
@@ -298,6 +318,7 @@ public:
     brpc::ClosureGuard done_guard(done);
 
     brpc::Controller *cntl = static_cast<brpc::Controller *>(controller);
+    _receiver.register_queue(0, new queue_type);
     _stream_options.handler = &_receiver;
     if (brpc::StreamAccept(&_receiver.m_stream_id, *cntl, &_stream_options) != 0) {
       cntl->SetFailed("Fail to accept stream");
@@ -363,6 +384,7 @@ struct StreamChannel :  public ::brpc::Channel {
     }
 
     _receiver.setPort(pt.port);
+    _receiver.register_queue(0, new queue_type);
     stream_options.handler = &_receiver;
     if (brpc::StreamCreate(&streamId, stream_cntl, &stream_options) != 0) {
       LOG(ERROR) << "Fail to create stream at port:" << pt.port;
